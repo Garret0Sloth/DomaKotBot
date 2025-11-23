@@ -16,7 +16,8 @@ from telegram.ext import (
 
 # ============ НАСТРОЙКИ ============
 
-BOT_TOKEN = "8354267156:AAH4u8FVXkWh0kr5AsRr6c2xPzT5OZmG7Xw"
+import os
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # ============ ЛОГИРОВАНИЕ ============
 
@@ -203,3 +204,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
