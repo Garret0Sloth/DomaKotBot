@@ -33,6 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ========= ПАМЯТЬ =========
 
+# users_status[user_id] = {name, status, updated_at, gender}
 users_status: Dict[int, Dict[str, Any]] = {}
 
 # Состояние "за сегодня"
@@ -48,10 +49,11 @@ db_pool: Optional[asyncpg.Pool] = None
 # ========= КЛАВИАТУРЫ =========
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
+def main_keyboard(gender: Optional[str] = None) -> ReplyKeyboardMarkup:
+    away_caption = "🚶 Я ушёл" if gender != "f" else "🚶 Я ушла"
     return ReplyKeyboardMarkup(
         [
-            ["🏠 Я дома", "🚶 Я ушёл"],
+            ["🏠 Я дома", away_caption],
             ["❓ Кто дома", "🐾 История кормлений"],
             ["🐱 Меню котов", "🏆 Рейтинг"],
         ],
@@ -74,6 +76,10 @@ def cats_keyboard() -> ReplyKeyboardMarkup:
 
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ =========
+
+
+def get_user_gender(user_id: int) -> Optional[str]:
+    return users_status.get(user_id, {}).get("gender")
 
 
 def format_dt(dt: Optional[datetime]) -> str:
@@ -159,12 +165,22 @@ async def setup_db() -> None:
             );
             """
         )
+        # Пол пользователя
+        await conn.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS gender TEXT
+            CHECK (gender IN ('m','f'));
+            """
+        )
 
 
-async def ensure_user_record(user_id: int, username: Optional[str], display_name: str) -> None:
-    """Создаём/обновляем запись пользователя в БД и даём права первому пользователю."""
+async def ensure_user_record(
+    user_id: int, username: Optional[str], display_name: str
+) -> Optional[str]:
+    """Создаём/обновляем запись пользователя и возвращаем его gender (если есть)."""
     if db_pool is None:
-        return
+        return None
     async with db_pool.acquire() as conn:
         await conn.execute(
             """
@@ -185,12 +201,18 @@ async def ensure_user_record(user_id: int, username: Optional[str], display_name
             await conn.execute("UPDATE users SET is_admin = TRUE WHERE user_id = $1;", user_id)
             logger.info("Пользователь %s назначен первым админом", user_id)
 
+        row = await conn.fetchrow("SELECT gender FROM users WHERE user_id = $1;", user_id)
+        return row["gender"] if row else None
+
 
 async def is_admin(user_id: int) -> bool:
     if db_pool is None:
         return False
     async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT is_admin FROM users WHERE user_id = $1 AND is_active = TRUE;", user_id)
+        val = await conn.fetchval(
+            "SELECT is_admin FROM users WHERE user_id = $1 AND is_active = TRUE;",
+            user_id,
+        )
         return bool(val)
 
 
@@ -255,7 +277,7 @@ async def reset_feedings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def post_init(app: Application) -> None:
-    """Запускается один раз при старте приложения: подключаем БД, создаём таблицы, подтягиваем день."""
+    """Старт приложения: подключаем БД, создаём таблицы, подтягиваем сегодняшние кормления."""
     global db_pool
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
@@ -278,17 +300,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = user.first_name or user.username or str(user.id)
 
+    gender = await ensure_user_record(user.id, user.username, name)
+
     users_status[user.id] = {
         "name": name,
         "status": "home",
         "updated_at": datetime.now(TZ),
+        "gender": gender,
     }
 
-    await ensure_user_record(user.id, user.username, name)
-
     await update.message.reply_text(
-        "Привет! Бот запущен 🐾\n\nИспользуй меню ниже.",
-        reply_markup=main_keyboard(),
+        "Привет! Бот запущен 🐾\n\n"
+        "Можно указать пол командой /setgender, тогда кнопка будет «ушёл» или «ушла» 🙂",
+        reply_markup=main_keyboard(gender),
     )
 
 
@@ -301,30 +325,40 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     name = user.first_name or user.username or str(user.id)
 
     if user.id not in users_status:
+        gender = await ensure_user_record(user.id, user.username, name)
         users_status[user.id] = {
             "name": name,
             "status": "unknown",
             "updated_at": datetime.now(TZ),
+            "gender": gender,
         }
-        await ensure_user_record(user.id, user.username, name)
+
+    gender = get_user_gender(user.id)
 
     # ---- жильцы ----
     if text == "🏠 Я дома":
         users_status[user.id]["status"] = "home"
         users_status[user.id]["updated_at"] = datetime.now(TZ)
-        await update.message.reply_text("Отмечено 🏠", reply_markup=main_keyboard())
+        await update.message.reply_text(
+            "Отмечено: ты дома 🏠",
+            reply_markup=main_keyboard(gender),
+        )
         return
 
-    if text == "🚶 Я ушёл":
+    if text in ("🚶 Я ушёл", "🚶 Я ушла"):
         users_status[user.id]["status"] = "away"
         users_status[user.id]["updated_at"] = datetime.now(TZ)
-        await update.message.reply_text("Отмечено 🚶", reply_markup=main_keyboard())
+        word = "ушёл" if gender != "f" else "ушла"
+        await update.message.reply_text(
+            f"Отмечено: ты {word} 🚶",
+            reply_markup=main_keyboard(gender),
+        )
         return
 
     if text == "❓ Кто дома":
         await update.message.reply_markdown(
             get_home_status_text(),
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(gender),
         )
         return
 
@@ -334,7 +368,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if text == "⬅️ Назад":
-        await update.message.reply_text("Главное меню", reply_markup=main_keyboard())
+        await update.message.reply_text("Главное меню", reply_markup=main_keyboard(gender))
         return
 
     if text == "🐾 История кормлений":
@@ -393,16 +427,20 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await update.message.reply_text("Не понял 🤔", reply_markup=main_keyboard())
+    await update.message.reply_text("Не понял 🤔", reply_markup=main_keyboard(gender))
 
 
 # ========= HANDLERS: ИСТОРИЯ И РЕЙТИНГ =========
 
 
 async def send_history_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """История за сегодня по всем кормлениям (из БД)."""
+    if update.message is None:
+        return
+
+    gender = get_user_gender(update.effective_user.id) if update.effective_user else None
+
     if db_pool is None:
-        await update.message.reply_text("База данных не настроена 😿")
+        await update.message.reply_text("База данных не настроена 😿", reply_markup=main_keyboard(gender))
         return
 
     async with db_pool.acquire() as conn:
@@ -418,7 +456,10 @@ async def send_history_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     if not rows:
-        await update.message.reply_text("Сегодня ещё никого не кормили 🐾", reply_markup=main_keyboard())
+        await update.message.reply_text(
+            "Сегодня ещё никого не кормили 🐾",
+            reply_markup=main_keyboard(gender),
+        )
         return
 
     cat_names = {k: v["label"] for k, v in cats_feeding.items()}
@@ -430,20 +471,26 @@ async def send_history_today(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"{r['fed_at'].astimezone(TZ).strftime('%H:%M')} — {cat_label} {emoji} ({r['fed_by_name']})"
         )
 
-    await update.message.reply_markdown("\n".join(lines), reply_markup=main_keyboard())
+    await update.message.reply_markdown(
+        "\n".join(lines),
+        reply_markup=main_keyboard(gender),
+    )
 
 
 async def send_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Рейтинг кормильцев по общему количеству кормлений."""
+    if update.message is None:
+        return
+
+    gender = get_user_gender(update.effective_user.id) if update.effective_user else None
+
     if db_pool is None:
-        await update.message.reply_text("База данных не настроена 😿")
+        await update.message.reply_text("База данных не настроена 😿", reply_markup=main_keyboard(gender))
         return
 
     chat_user = update.effective_user
     uid = chat_user.id if chat_user else None
 
     async with db_pool.acquire() as conn:
-        # топ кормильцев
         top_rows = await conn.fetch(
             """
             SELECT fed_by_id,
@@ -456,7 +503,6 @@ async def send_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             """
         )
 
-        # место текущего пользователя
         user_row = None
         total_people = 0
         if uid is not None:
@@ -477,7 +523,10 @@ async def send_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     break
 
     if not top_rows:
-        await update.message.reply_text("Пока никто ещё не кормил котов 🐾", reply_markup=main_keyboard())
+        await update.message.reply_text(
+            "Пока никто ещё не кормил котов 🐾",
+            reply_markup=main_keyboard(gender),
+        )
         return
 
     lines = ["🏆 *Рейтинг кормильцев:*", ""]
@@ -494,7 +543,10 @@ async def send_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append("")
         lines.append("Ты ещё ни разу не кормил(а) котов 😼")
 
-    await update.message.reply_markdown("\n".join(lines), reply_markup=main_keyboard())
+    await update.message.reply_markdown(
+        "\n".join(lines),
+        reply_markup=main_keyboard(gender),
+    )
 
 
 # ========= HANDLERS: АДМИНКА =========
@@ -514,7 +566,7 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT user_id, display_name, username, is_admin, is_active
+            SELECT user_id, display_name, username, is_admin, is_active, gender
               FROM users
           ORDER BY is_admin DESC, is_active DESC, display_name;
             """
@@ -531,6 +583,10 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             flags.append("admin")
         if not r["is_active"]:
             flags.append("inactive")
+        if r["gender"] == "m":
+            flags.append("m")
+        elif r["gender"] == "f":
+            flags.append("f")
         flag_str = f" ({', '.join(flags)})" if flags else ""
         lines.append(f"• {r['display_name']} — `{r['user_id']}`{flag_str}")
 
@@ -645,11 +701,68 @@ async def setname_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Пользователь не найден.")
         return
 
-    # обновляем в памяти
     if uid in users_status:
         users_status[uid]["name"] = new_name
 
     await update.message.reply_text(f"Имя пользователя {uid} изменено на: {new_name}")
+
+
+# ========= HANDLER: УСТАНОВКА ПОЛА =========
+
+
+def parse_gender_arg(arg: str) -> Optional[str]:
+    a = arg.lower()
+    if a in ("m", "м", "муж", "мужчина", "парень", "male", "man"):
+        return "m"
+    if a in ("f", "ж", "жен", "женщина", "девушка", "female", "woman", "girl"):
+        return "f"
+    return None
+
+
+async def setgender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None or update.message is None:
+        return
+
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /setgender <пол>\n"
+            "Например: /setgender м  или  /setgender ж"
+        )
+        return
+
+    gender = parse_gender_arg(context.args[0])
+    if gender is None:
+        await update.message.reply_text(
+            "Не понял пол. Варианты: м / ж / m / f / мужчина / женщина."
+        )
+        return
+
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET gender = $2 WHERE user_id = $1;",
+                user.id,
+                gender,
+            )
+
+    if user.id in users_status:
+        users_status[user.id]["gender"] = gender
+    else:
+        # на всякий случай
+        users_status[user.id] = {
+            "name": user.first_name or user.username or str(user.id),
+            "status": "unknown",
+            "updated_at": datetime.now(TZ),
+            "gender": gender,
+        }
+
+    word = "мужской" if gender == "m" else "женский"
+    await update.message.reply_text(
+        f"Пол установлен: {word}. Кнопка теперь будет «я ушёл/ушла» с нужным окончанием 🙂",
+        reply_markup=main_keyboard(gender),
+    )
 
 
 # ========= ЗАПУСК =========
@@ -663,6 +776,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setadmin", setadmin_cmd))
     app.add_handler(CommandHandler("deluser", deluser_cmd))
     app.add_handler(CommandHandler("setname", setname_cmd))
+    app.add_handler(CommandHandler("setgender", setgender_cmd))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
