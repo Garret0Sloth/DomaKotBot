@@ -258,7 +258,6 @@ def main():
 if __name__ == "__main__":
     main()    "grom": {"name": "🟤 Гром", "dry": None, "wet": None},
     "klava": {"name": "🟡 Клава", "dry": None},
-}
 
 # ============ КЛАВИАТУРЫ ============
 
@@ -426,5 +425,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
