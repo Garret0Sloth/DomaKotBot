@@ -6,7 +6,13 @@ from zoneinfo import ZoneInfo
 
 import asyncpg
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 # ========= НАСТРОЙКИ =========
 
@@ -25,33 +31,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ========= СОСТОЯНИЕ В ПАМЯТИ =========
+# ========= ПАМЯТЬ =========
 
-# текущий статус жильцов (приход/уход)
 users_status: Dict[int, Dict[str, Any]] = {}
 
-# последнее кормление котов за сегодня
+# Состояние "за сегодня"
 cats_feeding: Dict[str, Dict[str, Any]] = {
     "cassiy": {"label": "⚫ Кассий", "dry_time": None, "dry_by": None, "wet_time": None, "wet_by": None},
     "bulik": {"label": "🟠 Булик", "dry_time": None, "dry_by": None, "wet_time": None, "wet_by": None},
-    "grom":   {"label": "🟤 Гром",   "dry_time": None, "dry_by": None, "wet_time": None, "wet_by": None},
-    "klava":  {"label": "🟡 Клава",  "dry_time": None, "dry_by": None},  # только сухой
+    "grom":  {"label": "🟤 Гром",  "dry_time": None, "dry_by": None, "wet_time": None, "wet_by": None},
+    "klava": {"label": "🟡 Клава", "dry_time": None, "dry_by": None},  # только сухой
 }
 
-# пул соединений с БД
 db_pool: Optional[asyncpg.Pool] = None
 
 # ========= КЛАВИАТУРЫ =========
+
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             ["🏠 Я дома", "🚶 Я ушёл"],
             ["❓ Кто дома", "🐾 История кормлений"],
-            ["🐱 Меню котов"],
+            ["🐱 Меню котов", "🏆 Рейтинг"],
         ],
         resize_keyboard=True,
     )
+
 
 def cats_keyboard() -> ReplyKeyboardMarkup:
     # сначала 💧 (влажный), потом 🍖 (сухой)
@@ -66,62 +72,69 @@ def cats_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
+
 # ========= ВСПОМОГАТЕЛЬНЫЕ =========
+
 
 def format_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone(TZ).strftime("%H:%M %d.%m") if dt else "—"
+
 
 def get_home_status_text() -> str:
     if not users_status:
         return "Пока никто не отмечался."
 
     home, away = [], []
-
     for info in users_status.values():
         name = info["name"]
         status = info["status"]
-        time_str = format_dt(info["updated_at"])
-
+        t = format_dt(info["updated_at"])
         if status == "home":
-            home.append(f"• {name} (с {time_str})")
+            home.append(f"• {name} (с {t})")
         else:
-            away.append(f"• {name} (с {time_str})")
+            away.append(f"• {name} (с {t})")
 
     text = "🏠 *Дома:*\n" + ("\n".join(home) if home else "никого") + "\n\n"
     text += "🚶 *Вне дома:*\n" + ("\n".join(away) if away else "никого")
     return text
 
+
 def get_cats_status_text() -> str:
-    """История кормлений за сегодня (по последнему кормлению каждого типа)."""
     lines = ["🐾 *Кормление котов (за сегодня):*", ""]
     for key, data in cats_feeding.items():
         lines.append(data["label"] + ":")
 
-        # сперва влажный
+        # влажный
         if key != "klava":
-            wet_line = "  • 💧: " + (format_dt(data["wet_time"]) if data["wet_time"] else "—")
-            if data.get("wet_by"):
-                wet_line += f" ({data['wet_by']})"
-            lines.append(wet_line)
+            if data["wet_time"]:
+                line = f"  • 💧 {format_dt(data['wet_time'])}"
+                if data["wet_by"]:
+                    line += f" ({data['wet_by']})"
+            else:
+                line = "  • 💧 —"
+            lines.append(line)
 
-        # потом сухой
-        dry_line = "  • 🍖: " + (format_dt(data["dry_time"]) if data["dry_time"] else "—")
-        if data.get("dry_by"):
-            dry_line += f" ({data['dry_by']})"
-        lines.append(dry_line)
-
+        # сухой
+        if data["dry_time"]:
+            line = f"  • 🍖 {format_dt(data['dry_time'])}"
+            if data["dry_by"]:
+                line += f" ({data['dry_by']})"
+        else:
+            line = "  • 🍖 —"
+        lines.append(line)
         lines.append("")
 
     return "\n".join(lines).strip()
 
-# ========= РАБОТА С БД =========
+
+# ========= БАЗА ДАННЫХ =========
+
 
 async def setup_db() -> None:
-    """Создаём таблицу, если её ещё нет."""
     if db_pool is None:
-        logger.warning("DB pool не инициализирован, пропускаю setup_db.")
         return
     async with db_pool.acquire() as conn:
+        # История кормлений
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS feedings (
@@ -134,9 +147,55 @@ async def setup_db() -> None:
             );
             """
         )
+        # Пользователи
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                display_name TEXT,
+                is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE
+            );
+            """
+        )
 
-async def load_last_feedings() -> None:
-    """Подтягиваем последнее кормление за сегодня из БД (на случай рестарта бота)."""
+
+async def ensure_user_record(user_id: int, username: Optional[str], display_name: str) -> None:
+    """Создаём/обновляем запись пользователя в БД и даём права первому пользователю."""
+    if db_pool is None:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username, display_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE
+              SET username = EXCLUDED.username,
+                  display_name = COALESCE(EXCLUDED.display_name, users.display_name);
+            """,
+            user_id,
+            username,
+            display_name,
+        )
+
+        # если админов ещё нет — делаем этого пользователя админом
+        admins_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_admin = TRUE;")
+        if admins_count == 0:
+            await conn.execute("UPDATE users SET is_admin = TRUE WHERE user_id = $1;", user_id)
+            logger.info("Пользователь %s назначен первым админом", user_id)
+
+
+async def is_admin(user_id: int) -> bool:
+    if db_pool is None:
+        return False
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT is_admin FROM users WHERE user_id = $1 AND is_active = TRUE;", user_id)
+        return bool(val)
+
+
+async def load_last_feedings_today() -> None:
+    """Подтягиваем последнее кормление за сегодня для статуса."""
     if db_pool is None:
         return
     async with db_pool.acquire() as conn:
@@ -148,53 +207,55 @@ async def load_last_feedings() -> None:
                   FROM feedings
                  WHERE cat_code = $1
                    AND feed_type = 'dry'
-                   AND fed_at::date = (NOW() AT TIME ZONE $2)::date
+                   AND (fed_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
               ORDER BY fed_at DESC
                  LIMIT 1;
                 """,
-                cat_code, "Europe/Moscow",
+                cat_code,
+                "Europe/Moscow",
             )
             if row:
                 state["dry_time"] = row["fed_at"]
                 state["dry_by"] = row["fed_by_name"]
 
-            # влажный (кроме Клавы)
             if cat_code == "klava":
                 continue
+
             row = await conn.fetchrow(
                 """
                 SELECT fed_at, fed_by_name
                   FROM feedings
                  WHERE cat_code = $1
                    AND feed_type = 'wet'
-                   AND fed_at::date = (NOW() AT TIME ZONE $2)::date
+                   AND (fed_at AT TIME ZONE $2)::date = (NOW() AT TIME ZONE $2)::date
               ORDER BY fed_at DESC
                  LIMIT 1;
                 """,
-                cat_code, "Europe/Moscow",
+                cat_code,
+                "Europe/Moscow",
             )
             if row:
                 state["wet_time"] = row["fed_at"]
                 state["wet_by"] = row["fed_by_name"]
 
-async def reset_feedings_midnight() -> None:
-    """Полночь: очищаем сегодняшние кормления."""
+
+async def reset_feedings_today() -> None:
+    """Полночь: очищаем только 'состояние за сегодня', историю в БД не трогаем."""
     for state in cats_feeding.values():
         state["dry_time"] = None
         state["dry_by"] = None
         if "wet_time" in state:
             state["wet_time"] = None
             state["wet_by"] = None
+    logger.info("Сброшено состояние кормлений за сегодня.")
 
-    if db_pool is not None:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM feedings;")
 
 async def reset_feedings_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await reset_feedings_midnight()
+    await reset_feedings_today()
+
 
 async def post_init(app: Application) -> None:
-    """Вызывается один раз при старте приложения."""
+    """Запускается один раз при старте приложения: подключаем БД, создаём таблицы, подтягиваем день."""
     global db_pool
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
@@ -203,26 +264,33 @@ async def post_init(app: Application) -> None:
 
     db_pool = await asyncpg.create_pool(dsn=db_url)
     await setup_db()
-    await load_last_feedings()
+    await load_last_feedings_today()
     logger.info("БД инициализирована.")
 
-# ========= HANDLERS =========
+
+# ========= HANDLERS: БАЗОВЫЕ =========
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user is None or update.message is None:
         return
 
     user = update.effective_user
+    name = user.first_name or user.username or str(user.id)
+
     users_status[user.id] = {
-        "name": user.first_name or user.username or str(user.id),
+        "name": name,
         "status": "home",
         "updated_at": datetime.now(TZ),
     }
+
+    await ensure_user_record(user.id, user.username, name)
 
     await update.message.reply_text(
         "Привет! Бот запущен 🐾\n\nИспользуй меню ниже.",
         reply_markup=main_keyboard(),
     )
+
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.effective_user is None:
@@ -230,15 +298,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = update.message.text
     user = update.effective_user
+    name = user.first_name or user.username or str(user.id)
 
     if user.id not in users_status:
         users_status[user.id] = {
-            "name": user.first_name or user.username or str(user.id),
+            "name": name,
             "status": "unknown",
             "updated_at": datetime.now(TZ),
         }
+        await ensure_user_record(user.id, user.username, name)
 
-    # --- жильцы ---
+    # ---- жильцы ----
     if text == "🏠 Я дома":
         users_status[user.id]["status"] = "home"
         users_status[user.id]["updated_at"] = datetime.now(TZ)
@@ -258,7 +328,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # --- меню котов ---
+    # ---- меню котов / история / рейтинг ----
     if text == "🐱 Меню котов":
         await update.message.reply_text("Меню котов 🐱", reply_markup=cats_keyboard())
         return
@@ -268,13 +338,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if text == "🐾 История кормлений":
-        await update.message.reply_markdown(
-            get_cats_status_text(),
-            reply_markup=main_keyboard(),
-        )
+        await send_history_today(update, context)
         return
 
-    # --- кормление котов ---
+    if text == "🏆 Рейтинг":
+        await send_rating(update, context)
+        return
+
+    # ---- кормление котов ----
     now = datetime.now(TZ)
 
     mapping = {
@@ -290,56 +361,320 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if text in mapping:
         cat_code, feed_type = mapping[text]
         state = cats_feeding[cat_code]
-        user_name = users_status[user.id]["name"]
+
+        display_name = users_status[user.id]["name"]
 
         if feed_type == "dry":
             state["dry_time"] = now
-            state["dry_by"] = user_name
+            state["dry_by"] = display_name
         else:
             state["wet_time"] = now
-            state["wet_by"] = user_name
+            state["wet_by"] = display_name
 
-        # пишем в БД
         if db_pool is not None:
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO feedings (cat_code, feed_type, fed_at, fed_by_id, fed_by_name) "
-                    "VALUES ($1, $2, $3, $4, $5);",
+                    """
+                    INSERT INTO feedings (cat_code, feed_type, fed_at, fed_by_id, fed_by_name)
+                    VALUES ($1, $2, $3, $4, $5);
+                    """,
                     cat_code,
                     feed_type,
                     now,
                     user.id,
-                    user_name,
+                    display_name,
                 )
 
         await update.message.reply_text(
             f"{state['label']} накормлен "
             f"{'🍖' if feed_type == 'dry' else '💧'} "
-            f"в {now.strftime('%H:%M %d.%m')} ({user_name})",
+            f"в {now.strftime('%H:%M %d.%m')} ({display_name})",
             reply_markup=cats_keyboard(),
         )
         return
 
-    # --- неизвестный текст ---
     await update.message.reply_text("Не понял 🤔", reply_markup=main_keyboard())
 
+
+# ========= HANDLERS: ИСТОРИЯ И РЕЙТИНГ =========
+
+
+async def send_history_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """История за сегодня по всем кормлениям (из БД)."""
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена 😿")
+        return
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT fed_at, cat_code, feed_type, fed_by_name
+              FROM feedings
+             WHERE (fed_at AT TIME ZONE $1)::date = (NOW() AT TIME ZONE $1)::date
+          ORDER BY fed_at DESC
+             LIMIT 20;
+            """,
+            "Europe/Moscow",
+        )
+
+    if not rows:
+        await update.message.reply_text("Сегодня ещё никого не кормили 🐾", reply_markup=main_keyboard())
+        return
+
+    cat_names = {k: v["label"] for k, v in cats_feeding.items()}
+    lines = ["📜 *История кормлений за сегодня:*", ""]
+    for r in rows:
+        cat_label = cat_names.get(r["cat_code"], r["cat_code"])
+        emoji = "🍖" if r["feed_type"] == "dry" else "💧"
+        lines.append(
+            f"{r['fed_at'].astimezone(TZ).strftime('%H:%M')} — {cat_label} {emoji} ({r['fed_by_name']})"
+        )
+
+    await update.message.reply_markdown("\n".join(lines), reply_markup=main_keyboard())
+
+
+async def send_rating(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Рейтинг кормильцев по общему количеству кормлений."""
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена 😿")
+        return
+
+    chat_user = update.effective_user
+    uid = chat_user.id if chat_user else None
+
+    async with db_pool.acquire() as conn:
+        # топ кормильцев
+        top_rows = await conn.fetch(
+            """
+            SELECT fed_by_id,
+                   fed_by_name,
+                   COUNT(*) AS cnt
+              FROM feedings
+          GROUP BY fed_by_id, fed_by_name
+          ORDER BY cnt DESC
+             LIMIT 10;
+            """
+        )
+
+        # место текущего пользователя
+        user_row = None
+        total_people = 0
+        if uid is not None:
+            rows = await conn.fetch(
+                """
+                SELECT fed_by_id,
+                       fed_by_name,
+                       COUNT(*) AS cnt,
+                       RANK() OVER (ORDER BY COUNT(*) DESC) AS rnk
+                  FROM feedings
+              GROUP BY fed_by_id, fed_by_name
+                """
+            )
+            total_people = len(rows)
+            for r in rows:
+                if r["fed_by_id"] == uid:
+                    user_row = r
+                    break
+
+    if not top_rows:
+        await update.message.reply_text("Пока никто ещё не кормил котов 🐾", reply_markup=main_keyboard())
+        return
+
+    lines = ["🏆 *Рейтинг кормильцев:*", ""]
+    for i, r in enumerate(top_rows, start=1):
+        lines.append(f"{i}. {r['fed_by_name']} — {r['cnt']} раз")
+
+    if user_row:
+        lines.append("")
+        lines.append(
+            f"Твоё место: {user_row['rnk']} из {total_people}, "
+            f"{user_row['cnt']} кормлений"
+        )
+    else:
+        lines.append("")
+        lines.append("Ты ещё ни разу не кормил(а) котов 😼")
+
+    await update.message.reply_markdown("\n".join(lines), reply_markup=main_keyboard())
+
+
+# ========= HANDLERS: АДМИНКА =========
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("Только админ может смотреть список пользователей.")
+        return
+
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена.")
+        return
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT user_id, display_name, username, is_admin, is_active
+              FROM users
+          ORDER BY is_admin DESC, is_active DESC, display_name;
+            """
+        )
+
+    if not rows:
+        await update.message.reply_text("Пользователей пока нет.")
+        return
+
+    lines = ["👥 *Пользователи:*", ""]
+    for r in rows:
+        flags = []
+        if r["is_admin"]:
+            flags.append("admin")
+        if not r["is_active"]:
+            flags.append("inactive")
+        flag_str = f" ({', '.join(flags)})" if flags else ""
+        lines.append(f"• {r['display_name']} — `{r['user_id']}`{flag_str}")
+
+    await update.message.reply_markdown("\n".join(lines))
+
+
+async def setadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("Только админ может назначать админов.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /setadmin <user_id>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена.")
+        return
+
+    async with db_pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE users SET is_admin = TRUE WHERE user_id = $1 AND is_active = TRUE;",
+            uid,
+        )
+
+    if res.endswith("0"):
+        await update.message.reply_text("Пользователь не найден или не активен.")
+    else:
+        await update.message.reply_text(f"Пользователь {uid} назначен админом.")
+
+
+async def deluser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("Только админ может удалять пользователей.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /deluser <user_id>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена.")
+        return
+
+    async with db_pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE users SET is_active = FALSE WHERE user_id = $1;",
+            uid,
+        )
+
+    users_status.pop(uid, None)
+
+    if res.endswith("0"):
+        await update.message.reply_text("Пользователь не найден.")
+    else:
+        await update.message.reply_text(f"Пользователь {uid} деактивирован.")
+
+
+async def setname_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("Только админ может менять имена.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /setname <user_id> <Новое имя>")
+        return
+
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    new_name = " ".join(context.args[1:])
+
+    if db_pool is None:
+        await update.message.reply_text("База данных не настроена.")
+        return
+
+    async with db_pool.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE users SET display_name = $2 WHERE user_id = $1;",
+            uid,
+            new_name,
+        )
+        # Обновляем имя во всей истории кормлений
+        await conn.execute(
+            "UPDATE feedings SET fed_by_name = $2 WHERE fed_by_id = $1;",
+            uid,
+            new_name,
+        )
+
+    if res.endswith("0"):
+        await update.message.reply_text("Пользователь не найден.")
+        return
+
+    # обновляем в памяти
+    if uid in users_status:
+        users_status[uid]["name"] = new_name
+
+    await update.message.reply_text(f"Имя пользователя {uid} изменено на: {new_name}")
+
+
 # ========= ЗАПУСК =========
+
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("users", users_cmd))
+    app.add_handler(CommandHandler("setadmin", setadmin_cmd))
+    app.add_handler(CommandHandler("deluser", deluser_cmd))
+    app.add_handler(CommandHandler("setname", setname_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # джоба на полночь по Москве — чистим кормления
     job_queue = app.job_queue
     job_queue.run_daily(
         reset_feedings_job,
         time=dtime(hour=0, minute=0, second=0, tzinfo=TZ),
-        name="reset_feedings",
+        name="reset_feedings_today",
     )
 
     app.run_polling(poll_interval=2.0, timeout=10)
+
 
 if __name__ == "__main__":
     main()
